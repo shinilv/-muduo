@@ -25,7 +25,7 @@ title: muduo网路库的学习
 
 
 
-# 项目细节
+# 项目前置工具实现细节
 
 ## noncopyable 类
 C++ 中， 默认情况下所有的类都支持拷贝和构造， 有些对象逻辑上不应该被复制，
@@ -455,3 +455,390 @@ void Thread::setDefaultName() {
 }
 ~~~
 
+阶段测试
+编译指令：g++ test.cc ./src/CurrentThread.cc ./src/Thread.cc ./src/Timestamp.cc -o test -std=c++17 -I ./include
+~~~
+#include "Thread.h"
+#include <iostream>
+#include <chrono>
+
+void my_task() {
+    std::cout << "Thread " << CurrentThread::tid() << " is running." << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::cout << "Thread " << CurrentThread::tid() << " finished." << std::endl;
+}
+
+int main() {
+    Thread t1(my_task, "MyWorkerThread");
+    
+    std::cout << "Before start, Thread ID: " << t1.tid() << std::endl; // 可能输出 0，也可能因为未同步而不确定，但在本实现中，start()会等待，所以这里没问题？不，这里在start()之前调用，tid_还是0。
+    
+    t1.start();
+    
+    std::cout << "After start, Thread ID: " << t1.tid() << std::endl; // 一定能正确输出新线程的TID
+    
+    t1.join();
+    
+    std::cout << "Thread joined." << std::endl;
+    
+    return 0;
+}
+~~~
+
+# 项目重点类实现细节
+
+## Channel
+这个 Channel 类是 Reactor 事件驱动模型中的核心组件之一，
+是 **“事件分发器”或“I/O 对象代理”的角色。它的核心职责是封装一个文件描述符（fd）及其感兴趣的I/O 事件（如读、写），并在事件就绪时，将事件分发给事先注册好的回调函数**
+
+代码实现细节与解释
+**Channel.h**
+
+~~~
+#pragma once
+
+#include <functional>
+#include <memory>
+
+#include "noncopyable.h"
+#include "Timestamp.h"
+
+class EventLoop; 
+
+/**
+ * 理清楚 EventLoop、Channel、Poller之间的关系  Reactor模型上对应多路事件分发器
+ * Channel理解为通道 封装了sockfd和其感兴趣的event 如EPOLLIN、EPOLLOUT事件 还绑定了poller返回的具体事件
+ **/
+class Channel : noncopyable  // 继承noncopyable，禁止拷贝Channel对象
+{
+public:
+    // 定义回调函数类型：
+    // EventCallback 是无参无返回的函数对象，用于处理写、关闭、错误事件
+    using EventCallback = std::function<void()>; 
+    // ReadEventCallback 是带Timestamp参数的函数对象，用于处理读事件（时间戳记录事件发生时间）
+    using ReadEventCallback = std::function<void(Timestamp)>;
+
+    // 构造函数：初始化所属的EventLoop、文件描述符fd
+    Channel(EventLoop *loop, int fd);
+    ~Channel();  // 析构函数
+
+    // 处理Poller通知的事件，在EventLoop::loop()中被调用
+    void handleEvent(Timestamp receiveTime);
+
+    // 设置各种事件的回调函数，使用std::move转移所有权，避免拷贝开销
+    void setReadCallback(ReadEventCallback cb) { readCallback_ = std::move(cb); }
+    void setWriteCallback(EventCallback cb) { writeCallback_ = std::move(cb); }
+    void setCloseCallback(EventCallback cb) { closeCallback_ = std::move(cb); }
+    void setErrorCallback(EventCallback cb) { errorCallback_ = std::move(cb); }
+
+    // 绑定一个对象的shared_ptr，防止回调执行时对象被销毁（通过weak_ptr实现安全访问）
+    void tie(const std::shared_ptr<void> &);
+
+    // 以下是获取成员变量的内联函数：
+    int fd() const { return fd_; }         // 获取封装的文件描述符
+    int events() const { return events_; } // 获取感兴趣的事件集合
+    void set_revents(int revt) { revents_ = revt; } // 设置实际发生的事件（由Poller调用）
+
+    // 以下方法用于修改感兴趣的事件，并通知EventLoop更新Poller的监控
+    void enableReading() { events_ |= kReadEvent; update(); }  // 启用读事件
+    void disableReading() { events_ &= ~kReadEvent; update(); } // 禁用读事件
+    void enableWriting() { events_ |= kWriteEvent; update(); }  // 启用写事件
+    void disableWriting() { events_ &= ~kWriteEvent; update(); } // 禁用写事件
+    void disableAll() { events_ = kNoneEvent; update(); }       // 禁用所有事件
+
+    // 判断当前感兴趣的事件状态
+    bool isNoneEvent() const { return events_ == kNoneEvent; }
+    bool isWriting() const { return events_ & kWriteEvent; }
+    bool isReading() const { return events_ & kReadEvent; }
+
+    int index() { return index_; }         // 获取在Poller中的索引（用于Poller内部管理）
+    void set_index(int idx) { index_ = idx; } // 设置在Poller中的索引
+
+    EventLoop *ownerLoop() { return loop_; } // 获取所属的EventLoop
+    void remove();  // 从EventLoop和Poller中移除当前Channel
+private:
+
+    void update();  // 通知EventLoop更新Poller对当前Channel的监控
+    void handleEventWithGuard(Timestamp receiveTime); // 带对象生命周期保护的事件处理
+
+    // 静态常量，定义事件类型（位掩码）
+    static const int kNoneEvent;   // 无事件
+    static const int kReadEvent;   // 读事件（EPOLLIN | EPOLLPRI）
+    static const int kWriteEvent;  // 写事件（EPOLLOUT）
+
+    EventLoop *loop_;  // 所属的EventLoop，Channel的所有操作都在该loop的线程中执行
+    const int fd_;     // 封装的文件描述符，const表示fd一旦初始化不可修改
+    int events_;       // 感兴趣的事件（由用户设置，如读、写）
+    int revents_;      // 实际发生的事件（由Poller填充）
+    int index_;        // 在Poller中的索引，用于Poller高效管理事件
+
+    std::weak_ptr<void> tie_;  // 临时保护生命周期
+    bool tied_;                // 标记是否已绑定对象
+
+    // 事件发生时的回调函数
+    ReadEventCallback readCallback_;   // 读事件回调
+    EventCallback writeCallback_;      // 写事件回调
+    EventCallback closeCallback_;      // 关闭事件回调
+    EventCallback errorCallback_;      // 错误事件回调
+};
+~~~
+
+**Channel.cc**
+~~~
+#include <sys/epoll.h>  // 包含epoll相关系统调用宏（如EPOLLIN、EPOLLOUT、EPOLLHUP等）
+
+#include "Channel.h"    // 包含Channel类的声明
+#include "EventLoop.h"  // 包含EventLoop类的声明（用于调用updateChannel/removeChannel）
+#include "Logger.h"     // 日志工具类（用于打印事件处理日志）
+
+// 初始化Channel类的静态常量（事件类型定义）
+const int Channel::kNoneEvent = 0;                          // 空事件（无感兴趣的事件）
+const int Channel::kReadEvent = EPOLLIN | EPOLLPRI;         // 读事件：EPOLLIN（普通数据可读）+ EPOLLPRI（紧急数据可读）
+const int Channel::kWriteEvent = EPOLLOUT;                  // 写事件：EPOLLOUT（数据可写）
+
+// Channel构造函数：初始化成员变量
+// 参数：loop_（所属的EventLoop）、fd_（封装的文件描述符）
+Channel::Channel(EventLoop *loop, int fd)
+    : loop_(loop)    // 绑定当前Channel所属的EventLoop（一个Channel只能属于一个EventLoop）
+    , fd_(fd)        // 赋值封装的fd（const修饰，一旦初始化不可修改）
+    , events_(0)     // 初始化为空事件（默认不关注任何事件）
+    , revents_(0)    // 初始化为空（实际发生的事件由Poller填充）
+    , index_(-1)     // 初始化为-1（表示该Channel尚未注册到Poller中，用于Poller内部管理）
+    , tied_(false)   // 初始化为false（表示未绑定任何对象的生命周期）
+{
+}
+
+Channel::~Channel()
+{
+    // 析构函数为空：Channel不直接管理fd的生命周期（fd由TcpConnection等所有者管理）
+    // 仅当Channel被remove后，才会从Poller中移除fd的监控
+}
+
+// 绑定一个对象的shared_ptr，通过weak_ptr保护对象生命周期
+// 参数：obj（要绑定的对象的shared_ptr，通常是TcpConnection实例）
+void Channel::tie(const std::shared_ptr<void> &obj)
+{
+    tie_ = obj;      // 将shared_ptr赋值给weak_ptr（weak_ptr不增加引用计数，不影响对象销毁）
+    tied_ = true;    // 标记已绑定对象
+}
+
+// 通知EventLoop更新当前Channel在Poller中的监控状态（add/mod操作）
+void Channel::update()
+{
+    // 调用所属EventLoop的updateChannel方法，间接委托Poller处理fd的事件注册/修改
+    loop_->updateChannel(this);
+}
+
+// 通知EventLoop从Poller中移除当前Channel（del操作）
+void Channel::remove()
+{
+    // 调用所属EventLoop的removeChannel方法，间接委托Poller删除fd的监控
+    loop_->removeChannel(this);
+}
+
+// 核心方法：处理Poller通知的事件（在EventLoop::loop()中被调用）
+// 参数：receiveTime（事件发生的时间戳，由Poller传递）
+void Channel::handleEvent(Timestamp receiveTime)
+{
+    if (tied_)  // 如果已绑定对象（如TcpConnection），需要先检查对象是否存活
+    {
+        // 尝试将weak_ptr提升为shared_ptr：成功则对象存活，失败则对象已销毁
+        std::shared_ptr<void> guard = tie_.lock();
+        if (guard)  // 对象存活，执行带保护的事件处理
+        {
+            handleEventWithGuard(receiveTime);
+        }
+        // 若提升失败（对象已销毁），则不执行任何回调（避免访问已销毁对象）
+    }
+    else  // 未绑定对象，直接处理事件
+    {
+        handleEventWithGuard(receiveTime);
+    }
+}
+
+// 带对象生命周期保护的事件处理逻辑（实际执行回调的核心）
+void Channel::handleEventWithGuard(Timestamp receiveTime)
+{
+    // 打印日志：输出当前触发的事件类型（revents_是Poller填充的实际发生的事件）
+    LOG_INFO("channel handleEvent revents:%d\n", revents_);
+
+    // 1. 处理关闭事件（EPOLLHUP）：连接被对端关闭或挂起
+    // 条件：触发EPOLLHUP且未触发EPOLLIN（避免重复处理）
+    // 场景：如客户端调用close()关闭连接，服务端socket会触发EPOLLHUP
+    if ((revents_ & EPOLLHUP) && !(revents_ & EPOLLIN))
+    {
+        if (closeCallback_)  // 若注册了关闭回调，执行回调
+        {
+            closeCallback_();
+        }
+    }
+
+    // 2. 处理错误事件（EPOLLERR）：fd发生错误（如连接重置、fd无效）
+    if (revents_ & EPOLLERR)
+    {
+        if (errorCallback_)  // 若注册了错误回调，执行回调
+        {
+            errorCallback_();
+        }
+    }
+
+    // 3. 处理读事件（EPOLLIN：普通数据可读 / EPOLLPRI：紧急数据可读）
+    if (revents_ & (EPOLLIN | EPOLLPRI))
+    {
+        if (readCallback_)  // 若注册了读回调，传入事件发生时间戳并执行
+        {
+            readCallback_(receiveTime);
+        }
+    }
+
+    // 4. 处理写事件（EPOLLOUT：fd可写，如发送缓冲区有空闲空间）
+    if (revents_ & EPOLLOUT)
+    {
+        if (writeCallback_)  // 若注册了写回调，执行回调
+        {
+            writeCallback_();
+        }
+    }
+}
+~~~
+
+
+---
+这份实现完整体现了 Channel 类的核心职责：
+封装 fd 和事件（感兴趣事件 events_、实际发生事件 revents_）；
+提供回调注册接口，在事件发生时按优先级分发回调；
+通过 tie 机制保护对象生命周期，避免野指针访问；
+委托 EventLoop 与 Poller 交互，解耦底层 I/O 多路复用实现。
+---
+
+
+
+## Poller
+
+Poller 是 C++ 高性能网络编程（Reactor 模型）中的I/O 多路复用核心组件，
+封装了 epoll/poll/select 等底层系统调用，核心职责是批量监听多个文件描述符（fd）的感兴趣事件，
+当事件就绪时通知 EventLoop，是实现 “高并发” 的关键（避免为每个 fd 创建线程）。
+
+
+该功能核心目标
+---
+高效管理大量 fd（支持成千上万个并发连接）。
+阻塞等待就绪事件（减少 CPU 空轮询）。
+将就绪事件快速通知 EventLoop，由 EventLoop 分发给对应 Channel 执行回调。
+---
+
+Poller 通常是抽象基类，具体实现由 EpollPoller（封装 epoll）、PollPoller（封装 poll）等派生类完成。
+本项目只实现EpollPoller功能
+
+**Poller.h**
+~~~
+#pragma once
+
+#include <vector>
+#include <unordered_map>
+
+#include "noncopyable.h"
+#include "Timestamp.h"
+
+class Channel;
+class EventLoop;
+
+// muduo库中多路事件分发器的核心IO复用模块
+class Poller
+{
+public:
+    using ChannelList = std::vector<Channel *>;
+
+    Poller(EventLoop *loop);
+    virtual ~Poller() = default;
+
+    // 给所有IO复用保留统一的接口
+    virtual Timestamp poll(int timeoutMs, ChannelList *activeChannels) = 0;
+    virtual void updateChannel(Channel *channel) = 0;
+    virtual void removeChannel(Channel *channel) = 0;
+
+    // 判断参数channel是否在当前的Poller当中
+    bool hasChannel(Channel *channel) const;
+
+    // EventLoop可以通过该接口获取默认的IO复用的具体实现
+    static Poller *newDefaultPoller(EventLoop *loop);
+
+protected:
+    // map的key:sockfd value:sockfd所属的channel通道类型
+    using ChannelMap = std::unordered_map<int, Channel *>;
+    ChannelMap channels_;
+
+private:
+    EventLoop *ownerLoop_; // 定义Poller所属的事件循环EventLoop
+};
+~~~
+
+**Poller.cc**
+
+~~~
+#include "Poller.h"
+#include "Channel.h"
+
+Poller::Poller(EventLoop *loop)
+    : ownerLoop_(loop)
+{
+}
+
+bool Poller::hasChannel(Channel *channel) const
+{
+    auto it = channels_.find(channel->fd());
+    return it != channels_.end() && it->second == channel;
+}
+~~~
+
+## EPollPoller 实现
+EPollPoller 是 muduo 等 Reactor 模型框架中的核心组件，封装了 Linux 下的 epoll I/O 多路复用机制，
+用于高效监听大量文件描述符（fd）的读写事件，是实现高并发网络编程的关键
+
+Timestamp poll(int timeoutMs, ChannelList* activeChannels)
+这个函数是Poller的核心，将事件监听器听到该fd发生的事件写进Channel中的revents成员变量中，
+把这个Channel 装进activeChannels中，这样调用完之后能拿到事件监听器的监听结果
+
+**EPollPoller.h**
+~~~
+#pragma once
+
+#include <vector>
+#include <sys/epoll.h>
+
+#include "Poller.h"
+#include "Timestamp.h"
+
+class Channel;
+
+// EpollPoller 是 Poller 的子类，封装了 epoll 的功能实现
+class EPollPoller : public Poller {
+public:
+    // 构造函数：传入所属的 EventLoop
+    EPollPoller(EventLoop* loop);
+    // 析构函数：override 确保正确重写基类析构
+    ~EPollPoller() override;
+
+    // 重写基类的抽象方法，实现 epoll_wait 逻辑，返回活跃事件的时间戳
+    Timestamp poll(int timeoutMs, ChannelList* activeChannels) override;
+    // 重写基类方法，更新 Channel 在 epoll 中的事件监控状态
+    void updateChannel(Channel *channel) override;
+    // 重写基类方法，将 Channel 从 epoll 监控中移除
+    void removeChannel(Channel *channel) override;
+
+private:
+    // 定义 epoll_event 向量的初始容量，避免频繁扩容
+    static const int kInitEventListSize = 16;
+
+    // 核心辅助方法：将 epoll_wait 返回的就绪事件填充到 activeChannels（传出参数）
+    void fillActiveChannels(int numEvents, ChannelList *activeChannels) const;
+    // 底层辅助方法：调用 epoll_ctl 执行 ADD/MOD/DEL 操作，更新 epoll 内部状态
+    void update(int operation, Channel *channel);
+
+    // 类型别名：简化 epoll_event 向量的写法，提高代码可读性
+    using EventList = std::vector<epoll_event>;
+
+    int epollfd_; // epoll 实例的文件描述符（由 epoll_create 创建）
+    EventList events_; // 存储 epoll_wait 返回的就绪事件列表
+};
+~~~
