@@ -287,3 +287,171 @@ std::string Timestamp::toString() const {
 //     return 0;
 // }
 ~~~
+
+
+## 线程相关实现
+
+### CurrentThread
+
+Linux系统中，线程的ID(tid) 需要通过 syscall(SYS_gettid) 获取， 但是系统级的调用耗时较高
+若多线程的场景下频繁的获取tid， 会影响性能。
+CurrentThread 命名空间通过一下设计解决问题
+
+---
+1. 保存tid缓存，线程本地存储（__thread） 每个线程一个
+2. 首次获取时调用系统调用，后续直接返回缓存值
+3. 编译器优化指令提升判断效率
+---
+
+代码实现
+**CurrentThread.h**
+~~~
+#pragma once
+
+#include <unistd.h>
+#include <sys/syscall.h>
+
+namespace CurrentThread {
+    // __thread 用于声明线程本地存储变量
+    // 声明变量为外部定义（实际定义在 .cpp 文件中），避免头文件重复定义
+    extern __thread int t_cachedTid; // 保存tid缓存 因为系统调用非常耗时 拿到tid后将其保存
+
+    void cacheTid();
+
+    inline int tid() { // 内联函数只在当前文件中起作用 
+        // __builtin_expect 是一种底层优化 此语句意思是如果还未获取tid 进入if 通过cacheTid()系统调用获取tid
+        if (__builtin_expect(t_cachedTid == 0, 0)) {
+            cacheTid();
+        }
+        return t_cachedTid;
+    }
+}
+~~~
+**CurrentThread.ccZ**
+~~~
+#include "CurrentThread.h"
+
+namespace CurrentThread
+{
+    __thread int t_cachedTid = 0;
+
+    void cacheTid() {
+        // 首次获取，使用系统调用
+        if (t_cachedTid == 0) {
+            t_cachedTid = static_cast<pid_t>(::syscall(SYS_gettid));
+        }
+    }
+}
+~~~
+
+### Thread 线程的封装
+
+Thread 类是 C++ 中对线程操作的一个封装和增强。它的核心目标是让线程的创建、启动、管理和监控变得更加方便、安全和直观。
+Thread 类，基于C++11 标准库的std::thread 进行封装，解决了std::thread 在实际项目中的几个痛点
+
+---
+1. 线程状态管理，提供started_ 和 joined_ 成员变量解决了这个问题
+2. 线程标识，std::thread::id 是一个不透明的对象，
+这个类，通过tid_ 成员变量存储了操作系统分配的线程id(tid)， 提供了tid() 方法
+3. 线程命名
+4. 禁止拷贝，线程是一个独立的执行单元
+---
+
+代码实现
+**Thread.h**
+~~~
+#pragma once
+
+#include <functional>
+#include <thread>
+#include <memory>
+#include <string>
+#include <atomic>
+
+#include "noncopyable"
+
+class Thread : noncopyable {
+public:
+    using ThreadFunc = std::function<void()>;
+    explicit Thread(ThreadFunc, const std::string& name = std::string());
+    ~Thread();
+
+    void start();
+    void join();
+
+    bool started() {return started_; }
+    pid_t tid() const {return tid_; }
+    const std::string& name() const {return name_; }
+    static int numCreated() {return numCreated_; }
+
+private:
+    void setDefaultName();
+
+    // 线程状态
+    bool started_;
+    bool joined_;
+    std::shared_ptr<std::thread> thread_; 
+    pid_t tid_;       // 在线程创建时再绑定
+    ThreadFunc func_; // 线程回调函数
+    std::string name_; 
+    static std::atomic_int numCreated_; // 计数
+}
+~~~
+**Thread.cc**
+
+~~~
+#include "Thread.h"
+#include "CurrentThread.h" 
+
+#include <semaphore.h>
+
+std::atomic_int Thread::numCreated_(0);
+
+Thread::Thread(ThreadFunc func, const std::string name)
+    : started_(false)
+    , joined_(false)
+    , tid_(0)
+    , func_(std::move(func))
+    , name_(name) 
+{
+    setDefaultName();
+}
+Thread::~Thread() {
+    if (started_ && !joined_) {
+        thread_->detach();
+    }
+}
+
+void Thread::start()                                                        // 一个Thread对象 记录的就是一个新线程的详细信息
+{
+    started_ = true;
+    sem_t sem;
+    sem_init(&sem, false, 0);                                               // false指的是 不设置进程间共享
+    // 开启线程
+    thread_ = std::shared_ptr<std::thread>(new std::thread([&]() {
+        tid_ = CurrentThread::tid();                                        // 获取线程的tid值
+        sem_post(&sem);
+        func_();                                                            // 开启一个新线程 专门执行该线程函数
+    }));
+
+    // 这里必须等待获取上面新创建的线程的tid值
+    sem_wait(&sem);
+}
+
+// C++ std::thread 中join()和detach()的区别：https://blog.nowcoder.net/n/8fcd9bb6e2e94d9596cf0a45c8e5858a
+void Thread::join()
+{
+    joined_ = true;
+    thread_->join();
+}
+
+void Thread::setDefaultName() {
+    int num = ++numCreated_;
+    if (name_.empty()) {
+        char buf[32] = {0};
+        snprintf(buf, sizeof buf, "Thread%d", num);
+        name_ = buf;
+    }
+}
+~~~
+
