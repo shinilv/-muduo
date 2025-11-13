@@ -791,6 +791,36 @@ bool Poller::hasChannel(Channel *channel) const
 }
 ~~~
 
+**补充DefaultPoller.cc**
+
+~~~
+这段代码是一个非常优雅的设计，它通过工厂模式封装了 Poller 对象的创建过程。其核心特点和意图如下：
+封装实现细节：EventLoop 无需关心 Poller 的具体实现。
+默认高性能：优先选择 epoll 作为 I/O 多路复用的后端，以获得最佳性能。
+灵活性与可配置性：通过环境变量 MUDUO_USE_POLL，允许用户在必要时切换到 poll 实现，增强了代码的灵活性和可测试性。
+可扩展性：增加新的 Poller 实现非常方便，符合 “开放 - 封闭原则”。
+~~~
+
+~~~
+#include <stdlib.h>
+
+#include "Poller.h"
+#include "EPollPoller.h"
+
+//由于只实现了 EPollPoller，所以这样实现
+Poller *Poller::newDefaultPoller(EventLoop *loop)
+{
+    if (::getenv("MUDUO_USE_POLL"))
+    {
+        return nullptr; // 生成poll的实例
+    }
+    else
+    {
+        return new EPollPoller(loop); // 生成epoll的实例
+    }
+}
+~~~
+
 ## EPollPoller 实现
 EPollPoller 是 muduo 等 Reactor 模型框架中的核心组件，封装了 Linux 下的 epoll I/O 多路复用机制，
 用于高效监听大量文件描述符（fd）的读写事件，是实现高并发网络编程的关键
