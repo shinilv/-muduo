@@ -721,11 +721,11 @@ Poller 是 C++ 高性能网络编程（Reactor 模型）中的I/O 多路复用�
 
 
 该功能核心目标
----
+~~~
 高效管理大量 fd（支持成千上万个并发连接）。
 阻塞等待就绪事件（减少 CPU 空轮询）。
 将就绪事件快速通知 EventLoop，由 EventLoop 分发给对应 Channel 执行回调。
----
+~~~
 
 Poller 通常是抽象基类，具体实现由 EpollPoller（封装 epoll）、PollPoller（封装 poll）等派生类完成。
 本项目只实现EpollPoller功能
@@ -842,3 +842,399 @@ private:
     EventList events_; // 存储 epoll_wait 返回的就绪事件列表
 };
 ~~~
+
+具体功能实现
+**EPollPoller.cc**
+~~~
+#include "EPollPoller.h"
+#include "Logger.h"
+#include "Channel.h"
+
+#include <errno.h>
+#include <unistd.h>
+#include <string.h>
+#include <assert.h>
+
+const int kNew = -1;    // 某个channel还没添加至Poller          // channel的成员index_初始化为-1
+const int kAdded = 1;   // 某个channel已经添加至Poller
+const int kDeleted = 2; // 某个channel已经从Poller删除
+
+EPollPoller::EPollPoller(EventLoop *loop) 
+    :Poller(loop)
+    ,epollfd_(::epoll_create(EPOLL_CLOEXEC))
+    ,events_(kInitEventListSize)  // std::vector<epoll_event>(16)
+{
+    if (epollfd_ < 0) {
+        LOG_FATAL("epoll_create error:%d\n", errno);
+    }
+}
+EPollPoller::~EPollPoller() {
+    ::close(epollfd_);
+}
+
+// 监听
+Timestamp EPollPoller::poll(int timeoutMs, ChannelList *activeChannels) {
+    // 由于频繁调用poll 实际上应该用LOG_DEBUG输出日志更为合理 当遇到并发场景 关闭DEBUG日志提升效率
+    LOG_INFO("func=%s => fd total count:%lu\n", __FUNCTION__, channels_.size());
+
+    int numEvents = ::epoll_wait(epollfd_, &*events_.begin(), static_cast<int>(events_.size()), timeoutMs);
+    int saveErrno = errno;
+    // 返回事件发生的精准时间
+    Timestamp now(Timestamp::now());
+
+    if (numEvents > 0) {
+        LOG_INFO("%d events happend\n", numEvents); // LOG_DEBUG最合理
+        fillActiveChannels(numEvents, activeChannels);
+        if (numEvents == events_.size()) {
+            // 扩容操作
+            events_.resize(events_.size() * 2);
+        }
+    } else if (numEvents == 0) {
+        LOG_DEBUG("%s timeout!\n", __FUNCTION__);
+    } else {
+        if (saveErrno != EINTR) {
+            errno = saveErrno;
+            LOG_ERROR("EPollPoller::poll() error!");
+        }
+    }
+    return now;
+}
+// 重写基类方法，更新 Channel 在 epoll 中的事件监控状态
+void EPollPoller::updateChannel(Channel *channel) {
+    const int index = channel->index();
+    LOG_INFO("func=%s => fd=%d events=%d index=%d\n", __FUNCTION__, channel->fd(), channel->events(), index);
+
+    if (index == kNew || index == kDeleted) {
+        if (index == kNew) {
+            int fd = channel->fd();
+            channels_[fd] = channel;
+        } else { // index == kDeleted
+        } 
+        channel->set_index(kAdded); // 将状态设置为“已添加”
+        update(EPOLL_CTL_ADD, channel); // 调用底层update函数，执行epoll_ctl ADD操作
+    } else {
+        // channel已经在Poller中注册过了
+        // 断言：确保在channels_映射表中能找到这个fd，这是一个一致性检查
+        assert(channels_.find(fd) != channels_.end());
+        assert(channels_[fd] == channel);
+        int fd = channel->fd();
+        if (channel->isNoneEvent()) {
+            update(EPOLL_CTL_DEL, channel);
+            channel->set_index(kDeleted);
+        }
+        else {
+            update(EPOLL_CTL_MOD, channel);
+        }
+    }
+}
+// 重写基类方法，将 Channel 从 epoll 监控中移除
+void EPollPoller::removeChannel(Channel *channel) {
+    int fd = channel->fd();
+    channels_.erase(fd);
+
+    LOG_INFO("func=%s => fd=%d\n", __FUNCTION__, fd);
+
+    int index = channel->index();
+    if (index == kAdded)
+    {
+        update(EPOLL_CTL_DEL, channel);
+    }
+    channel->set_index(kNew);
+}
+
+
+// 核心辅助方法：将 epoll_wait 返回的就绪事件填充到 activeChannels（传出参数）
+// 填写活跃的连接
+void EPollPoller::fillActiveChannels(int numEvents, ChannelList *activeChannels) const
+{
+    // 遍历所有epoll返回的就绪事件
+    for (int i = 0; i < numEvents; ++i)
+    {
+        // 1. 从epoll_event中获取Channel指针
+        // events_[i] 是一个 struct epoll_event
+        // events_[i].data.ptr 是我们在调用epoll_ctl时，通过 event.data.ptr 字段存入的 Channel*
+        // 这里是将其强制转换回 Channel* 类型
+        Channel *channel = static_cast<Channel *>(events_[i].data.ptr);
+        
+        // 2. 将epoll返回的具体事件类型设置到Channel对象中
+        // events_[i].events 是一个整数，代表了发生的事件类型（如 EPOLLIN, EPOLLOUT, EPOLLERR）
+        // channel->set_revents(...) 将这个事件类型存入Channel的 revents_ 成员变量
+        // 这个 revents_ 就是Channel的 handleEvent() 方法判断应该执行哪个回调的依据
+        channel->set_revents(events_[i].events);
+        
+        // 3. 将就绪的Channel添加到输出列表中
+        // activeChannels 是一个由 EventLoop 传入的空列表
+        // push_back(channel) 将当前这个发生了事件的Channel指针添加到列表末尾
+        activeChannels->push_back(channel); // EventLoop就拿到了它的Poller给它返回的所有发生事件的channel列表了
+    }
+}
+
+// 底层辅助方法：调用 epoll_ctl 执行 ADD/MOD/DEL 操作，更新 epoll 内部状态
+void EPollPoller::update(int operation, Channel *channel) {
+    epoll_event event; 
+    ::memset(&event, 0, sizeof(event));
+
+    int fd = channel->fd();
+
+    event.events = channel->events();
+    event.data.fd = fd;
+    //这是最关键的一步！将 Channel 对象的指针存入 event.data.ptr 字段。
+    // 当这个 fd 上有事件发生时，epoll_wait 会返回这个 event 结构体，
+    // 我们就可以通过 event.data.ptr 快速地找到对应的 Channel 对象，
+    // 而无需再通过 fd 去 channels_ 映射表中查找。这是 Channel 和 epoll_event 之间的直接桥梁。
+    event.data.ptr = channel;
+
+    if (::epoll_ctl(epollfd_, operation, fd, &event) < 0) {
+        if (operation == EPOLL_CTL_DEL) {
+            LOG_ERROR("epoll_ctl del error:%d\n", errno);
+        } else {
+            LOG_FATAL("epoll_ctl add/mod error:%d\n", errno);
+        }
+    }
+}
+~~~
+
+## EventLoop
+作为一个网络服务器，需要有持续监听，持续获取监听结果，持续处理监听结果对应事件的能力
+也就是我们需要循环的去 **调用Poller::poll方法获取实际发生事件的Channel集合** 然后
+调用这些Channel里面保管的不同类型事件的处理函数
+EventLoop就是负责实现 “循环” ，负责驱动 “循环” 的重要模块
+这个类整合封装了二者并向上提供了更方便的接口
+
+**EventLoop.h**
+~~~
+#pragma once
+
+#include <functional>
+#include <vector>
+#include <atomic>
+#include <memory>
+#include <mutex>
+ 
+#include "noncopyable.h"
+#include "Timestamp.h"
+#include "CurrentThread.h"
+
+// 前置声明，避免循环依赖
+class Channel;
+class Poller;
+
+/**
+ * @brief 事件循环类 (Reactor 模式的核心)
+ * 
+ * 一个 EventLoop 实例代表一个独立的事件循环线程。它负责：
+ * 1. 通过 Poller (I/O 多路复用器) 等待 I/O 事件（如 socket 可读、可写）。
+ * 2. 当事件发生时，调用相应 Channel 的回调函数进行处理。
+ * 3. 执行用户通过 runInLoop/queueInLoop 投递的任务（Functor）。
+ * 
+ * 核心特性：
+ * - 每个 EventLoop 对象绑定一个线程，通过 threadId_ 标识。
+ * - 线程安全的任务队列 (pendingFunctors_)，允许跨线程投递任务。
+ * - 使用 wakeupFd_ 实现高效的跨线程唤醒。
+ * 
+ * 注意：
+ * - 一个线程只能拥有一个 EventLoop 对象。
+ * - EventLoop 的生命周期通常由其所属的线程（如 TcpServer 的主循环线程）管理。
+ */
+class EventLoop : noncopyable
+{
+public:
+    // 定义任务回调类型
+    using Functor = std::function<void()>;
+
+    /**
+     * @brief 构造函数
+     * 
+     * 在构造时，会：
+     * 1. 记录当前线程 ID (threadId_)。
+     * 2. 创建 Poller 对象 (epoll/poll 的封装)。
+     * 3. 创建 wakeupFd_ (通过 eventfd) 并封装成 wakeupChannel_。
+     * 4. 将 wakeupChannel_ 的读事件回调设置为 handleRead，用于唤醒事件循环。
+     */
+    EventLoop();
+    
+
+    /**
+     * @brief 析构函数
+     * 
+     * 确保在析构时事件循环已经停止 (quit_ 为 true)。
+     */
+    ~EventLoop();
+
+    /**
+     * @brief 启动事件循环的主循环
+     * 
+     * 这是 EventLoop 的核心方法，调用后会进入一个无限循环，直到 quit() 被调用。
+     * 循环逻辑：
+     * 1. 调用 Poller::poll() 阻塞等待事件，超时时间由 kPollTimeMs 指定。
+     * 2. poll() 返回后，获取就绪的 Channel 列表 (activeChannels_)。
+     * 3. 遍历 activeChannels_，调用每个 Channel 的 handleEvent() 方法处理事件。
+     * 4. 执行 doPendingFunctors()，处理在此期间被投递到队列中的任务。
+     * 
+     * 注意：此方法会阻塞调用线程，通常在一个线程的主函数中调用。
+     */
+    void loop();
+
+    /**
+     * @brief 安全地退出事件循环
+     * 
+     * 设置 quit_ 标志为 true。如果调用此方法的线程不是 EventLoop 所属的线程，
+     * 必须唤醒事件循环线程，使其从 poll() 的阻塞中返回，以便检查 quit_ 标志并退出。
+     */
+    void quit();
+
+    /**
+     * @brief 获取最近一次 poll() 返回的时间戳
+     * @return Timestamp 最近一次 I/O 事件就绪的时间
+     */
+    Timestamp pollReturnTime() const;
+
+    /**
+     * @brief 在 EventLoop 所属的线程中执行一个任务
+     * 
+     * 如果调用此方法的线程就是 EventLoop 所属的线程，则立即执行任务 cb。
+     * 否则，将任务 cb 投递到任务队列 pendingFunctors_ 中，并唤醒事件循环线程以尽快执行。
+     * 
+     * @param cb 要执行的任务回调
+     */
+    void runInLoop(Functor cb);
+
+    /**
+     * @brief 将一个任务投递到 EventLoop 的任务队列中，待后续执行
+     * 
+     * 此方法是线程安全的。它会将任务 cb 加入 pendingFunctors_，
+     * 并根据情况决定是否需要唤醒事件循环线程。
+     * 唤醒的条件是：
+     * 1. 调用线程不是 EventLoop 所属线程。
+     * 2. 事件循环正在执行任务队列 (callingPendingFunctors_ 为 true)，以避免新任务被延迟到下一轮 poll。
+     * 
+     * @param cb 要投递的任务回调
+     */
+    void queueInLoop(Functor cb);
+
+    /**
+     * @brief 唤醒 EventLoop 线程
+     * 
+     * 通过向 wakeupFd_ 写入一个字节的数据，使阻塞在 poll() 上的 EventLoop 线程立即返回。
+     * 这是实现跨线程唤醒 EventLoop 的标准方法。
+     */
+    void wakeup();
+
+    /**
+     * @brief 更新 Channel 的事件注册
+     * 
+     * 此方法是 Channel 和 Poller 之间的桥梁。当 Channel 的感兴趣事件发生变化时，
+     * 它会调用此方法通知 Poller 更新其内部的数据结构 (如 epoll_ctl)。
+     * 
+     * @param channel 需要更新的 Channel 对象
+     */
+    void updateChannel(Channel *channel);
+
+    /**
+     * @brief 将 Channel 从 Poller 的监听列表中移除
+     * 
+     * 当一个连接关闭时，TcpConnection 会调用此方法将其对应的 Channel 从 EventLoop 中注销。
+     * 
+     * @param channel 需要移除的 Channel 对象
+     */
+    void removeChannel(Channel *channel);
+
+    /**
+     * @brief 检查 EventLoop 是否正在监听某个特定的 Channel
+     * @param channel 要检查的 Channel 对象
+     * @return true 如果正在监听，false 否则
+     */
+    bool hasChannel(Channel *channel);
+
+    /**
+     * @brief 检查当前调用线程是否是 EventLoop 所属的线程
+     * @return true 如果是，false 否则
+     */
+    bool isInLoopThread() const;
+
+private:
+    /**
+     * @brief wakeupFd_ 的读事件回调函数
+     * 
+     * 当其他线程调用 wakeup() 向 wakeupFd_ 写入数据时，此回调会被触发。
+     * 它的主要工作是从 wakeupFd_ 中读取数据（通常是 8 字节），以清空内核缓冲区，
+     * 使 wakeupFd_ 可以再次用于唤醒。它本身不执行任何业务逻辑。
+     */
+    void handleRead();
+
+    /**
+     * @brief 执行 pendingFunctors_ 队列中的所有任务
+     * 
+     * 为了避免在执行任务的过程中，任务队列被反复加锁（特别是当任务本身又调用 queueInLoop 时），
+     * 此函数采用了“ swap and dispatch ”的策略：
+     * 1. 用一个局部向量 functors 与 pendingFunctors_ 进行交换。
+     * 2. 解锁，这样其他线程可以继续向 pendingFunctors_ 中添加任务。
+     * 3. 遍历局部向量 functors 并执行其中的所有任务。
+     * 
+     * callingPendingFunctors_ 标志在任务执行期间被设为 true，用于 queueInLoop 判断是否需要唤醒。
+     */
+    void doPendingFunctors();
+
+    // --- 成员变量 ---
+
+    /// @brief 标记事件循环是否正在运行
+    std::atomic_bool looping_;
+
+    /// @brief 标记是否需要退出事件循环
+    std::atomic_bool quit_;
+
+    /// @brief 记录当前 EventLoop 所属的线程 ID
+    const pid_t threadId_;
+
+    /// @brief 记录最近一次 poll() 返回的时间戳
+    Timestamp pollReturnTime_;
+
+    /// @brief 指向 Poller 对象的智能指针，由 EventLoop 唯一拥有
+    std::unique_ptr<Poller> poller_;
+
+    /// @brief 用于跨线程唤醒的文件描述符，由 eventfd() 创建
+    int wakeupFd_;
+
+    /// @brief 封装 wakeupFd_ 的 Channel 对象
+    std::unique_ptr<Channel> wakeupChannel_;
+
+    /// @brief 存储每次 poll() 返回的就绪 Channel 列表
+    ChannelList activeChannels_;
+
+    /// @brief 保护 pendingFunctors_ 的互斥锁
+    std::mutex mutex_;
+
+    /// @brief 存储等待被执行的任务队列
+    std::vector<Functor> pendingFunctors_;
+
+    /// @brief 标记当前是否正在执行 pendingFunctors_ 中的任务
+    /// 用于在 queueInLoop 中判断，当任务在执行期间又有新任务到来时，需要唤醒以避免延迟。
+    std::atomic_bool callingPendingFunctors_;
+};
+~~~
+
+以上一共实现了三个模块的实现，Poller，Channel，EventLoop。
+1. EventLoop
+角色：驱动循环的核心。它通过不断调用 Poller 监听事件，获取就绪事件后触发 Channel 的回调，
+同时处理异步任务队列，是整个事件驱动流程的 “发动机”。
+2. Poller
+角色：事件监听器的结果获取者。它封装了 epoll 或 poll 等 I/O 多路复用机制，
+负责从操作系统层面获取哪些文件描述符（fd）发生了感兴趣的事件（如可读、可写），并将结果反馈给 EventLoop。
+3. Channel
+角色：fd 及其属性的封装者。
+它将 fd、感兴趣的事件（如 EPOLLIN）、实际发生的事件（如 revents_）以及对应的回调函数（读、写、关闭、错误回调）整合在一起，
+使得 fd 的事件管理和回调触发逻辑更加内聚，在 EventLoop 和 Poller 之间起到了 “桥梁” 作用，方便模块间的事件传递与处理。
+
+
+**One Loop Per Thresd含义引入**
+每一个EventLoop都绑定了一个线程（一对一绑定），这种运行模式是Muduo库的特色充分利用了多核cpu的能力。
+muduo 通过 “一线程一循环” 的设计，既利用了多核的性能，又简化了线程安全的复杂度 —— 这是它能成为高性能网络库的关键设计之一。
+
+
+
+
+## Acceptor
+
+Acceptor封装了服务器监听套接字fd以及相关处理方法，
+这个类主要是对其他方法调用的封装
+
