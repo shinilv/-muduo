@@ -485,6 +485,82 @@ int main() {
 }
 ~~~
 
+## InetAddress 和 Socket
+
+### InetAddress
+InetAddress 类是一个封装了 IPv4 socket 地址结构（sockaddr_in）的工具类
+InetAddress 是网络编程中一个非常基础且实用的辅助类。
+它将底层、繁琐的 C 语言 socket 地址操作封装成了优雅、安全的 C++ 方法，使得开发者能够更专注于业务逻辑，而不是底层的字节序转换和结构体操作。
+
+~~~
+#pragma once
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <string>
+
+// 封装socket地址类型
+class InetAddress
+{
+public:
+    // 构造函数 1：使用端口号和 IP 字符串创建对象
+    explicit InetAddress(uint16_t port = 0, std::string ip = "127.0.0.1");
+    // 构造函数 2：使用已有的 sockaddr_in 结构体创建对象
+    explicit InetAddress(const sockaddr_in &addr)
+        : addr_(addr)
+    {
+    }
+    
+    std::string toIp() const;
+    std::string toIpPort() const;
+    uint16_t toPort() const;
+
+    const sockaddr_in *getSockAddr() const { return &addr_; }
+    void setSockAddr(const sockaddr_in &addr) { addr_ = addr; }
+
+private:
+    sockaddr_in addr_; 
+};
+~~~
+
+### Socket
+Socket 类是对操作系统底层 socket 文件描述符（fd）的封装，遵循 noncopyable 语义（不可拷贝），核心作用是隐藏 socket 系统调用的底层细节，提供安全、简洁的 C++ 接口，用于创建、绑定、监听、接受连接等 TCP 通信核心操作。
+
+~~~
+#pragma once
+
+#include "noncopyable.h"
+
+class InetAddress;
+
+// 封装socket fd
+class Socket : noncopyable
+{
+public:
+    explicit Socket(int sockfd)
+        : sockfd_(sockfd)
+    {
+    }
+    ~Socket();
+
+    int fd() const { return sockfd_; }
+    void bindAddress(const InetAddress &localaddr);
+    void listen();
+    int accept(InetAddress *peeraddr);
+
+    void shutdownWrite();
+
+    void setTcpNoDelay(bool on);
+    void setReuseAddr(bool on);
+    void setReusePort(bool on);
+    void setKeepAlive(bool on);
+
+private:
+    const int sockfd_;
+};
+
+~~~
+
 # 项目重点类实现细节
 
 ## Channel
