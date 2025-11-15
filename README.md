@@ -1344,3 +1344,145 @@ muduo 通过 “一线程一循环” 的设计，既利用了多核的性能，
 Acceptor封装了服务器监听套接字fd以及相关处理方法，
 这个类主要是对其他方法调用的封装
 
+Acceptor 是 Reactor 模型中的连接接收器核心组件，专门负责监听指定端口、接收客户端新连接，并将连接分发交给上层处理（如 TcpServer），是 TCP 服务器接收连接的 “入口”。
+
+作用： 监听端口 + 接受连接，屏蔽底层Socket，Channel的写作细节，
+向上提供简洁的新连接回调接口
+
+依赖 Socket：管理监听用的 socket（acceptSocket_），负责绑定、监听端口。
+依赖 Channel：监听 acceptSocket_ 的读事件（有新连接时触发），并回调 handleRead() 处理。
+依赖 EventLoop：运行在指定的事件循环中（通常是 mainLoop），由 EventLoop 驱动事件响应。
+
+**Acceptor.h**
+
+~~~
+#pragma once
+
+#include <functional>
+
+#include "noncopyable.h"
+#include "Socket.h"
+#include "Channel.h"
+
+class EventLoop;
+class InetAddress;
+
+class Acceptor : noncopyable
+{
+public:
+    using NewConnectionCallback = std::function<void(int sockfd, const InetAddress &)>;
+
+    Acceptor(EventLoop *loop, const InetAddress &listenAddr, bool reuseport);
+    ~Acceptor();
+    //设置新连接的回调函数
+    void setNewConnectionCallback(const NewConnectionCallback &cb) { NewConnectionCallback_ = cb; }
+    // 判断是否在监听
+    bool listenning() const { return listenning_; }
+    // 监听本地端口
+    void listen();
+
+private:
+    void handleRead();//处理新用户的连接事件
+
+    EventLoop *loop_; // Acceptor用的就是用户定 义的那个baseLoop 也称作mainLoop
+    Socket acceptSocket_;//专门用于接收新连接的socket
+    Channel acceptChannel_;//专门用于监听新连接的channel
+    NewConnectionCallback NewConnectionCallback_;//新连接的回调函数
+    bool listenning_;//是否在监听
+};
+~~~
+
+**Acceptor.cc**
+~~~
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <errno.h>
+#include <unistd.h>
+
+#include "Acceptor.h"
+#include "Logger.h"
+#include "InetAddress.h"
+
+static int createNonblocking()
+{
+    /*
+        SOCK_STREAM：TCP 流式协议（面向连接、可靠传输）。
+        SOCK_NONBLOCK：设置 fd 为非阻塞模式，避免 accept 等操作阻塞 EventLoop。
+        SOCK_CLOEXEC：进程执行 exec 系统调用时自动关闭该 fd，避免 fd 泄漏到子进程。
+    */
+    int sockfd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
+    if (sockfd < 0)
+    {
+        LOG_FATAL("%s:%s:%d listen socket create err:%d\n", __FILE__, __FUNCTION__, __LINE__, errno);
+    }
+    return sockfd;
+}
+
+Acceptor::Acceptor(EventLoop *loop, const InetAddress &listenAddr, bool reuseport)
+    : loop_(loop)
+    , acceptSocket_(createNonblocking())  // 初始化监听socket
+    , acceptChannel_(loop, acceptSocket_.fd()) // 绑定loop和监听 fd
+    , listenning_(false) 
+{
+    acceptSocket_.setReuseAddr(true);   
+    acceptSocket_.setReusePort(true);
+    acceptSocket_.bindAddress(listenAddr); // 绑定监听地址
+    // TcpServer::start() => Acceptor.listen() 如果有新用户连接 要执行一个回调(accept => connfd => 打包成Channel => 唤醒subloop)
+    // baseloop监听到有事件发生 => acceptChannel_(listenfd) => 执行该回调函数
+    acceptChannel_.setReadCallback(
+        std::bind(&Acceptor::handleRead, this));
+}
+
+Acceptor::~Acceptor()
+{
+    acceptChannel_.disableAll();    // 把从Poller中感兴趣的事件删除掉
+    acceptChannel_.remove();        // 调用EventLoop->removeChannel => Poller->removeChannel 把Poller的ChannelMap对应的部分删除
+}
+
+void Acceptor::listen()
+{
+    listenning_ = true;
+    acceptSocket_.listen();         // listen
+    acceptChannel_.enableReading(); // acceptChannel_注册至Poller !重要
+}
+
+// listenfd有事件发生了，就是有新用户连接了
+void Acceptor::handleRead()
+{
+    InetAddress peerAddr;  //存客户端地址
+    int connfd = acceptSocket_.accept(&peerAddr);
+    if (connfd >= 0)
+    {
+        if (NewConnectionCallback_) // 如果设置了回调
+        {
+            NewConnectionCallback_(connfd, peerAddr); // 轮询找到subLoop 唤醒并分发当前的新客户端的Channel
+        }
+        else
+        {
+            ::close(connfd);
+        }
+    }
+    else
+    {
+        LOG_ERROR("%s:%s:%d accept err:%d\n", __FILE__, __FUNCTION__, __LINE__, errno);
+        if (errno == EMFILE)
+        {
+            LOG_ERROR("%s:%s:%d sockfd reached limit\n", __FILE__, __FUNCTION__, __LINE__);
+        }
+    }
+}
+
+~~~
+
+## 补充工具类 Buffer
+Buffer 类是网络编程中一种高效的内存缓冲区管理工具，核心设计目标是减少内存拷贝、优化 I/O 操作性能，同时提供安全、便捷的读写接口。
+
+**核心设计思想**
+
+~~~
+Buffer 的设计基于 “预分配 + 读写索引分离 + 动态扩容” 模式，解决了直接使用 std::vector 或 C 数组的三大痛点：
+减少内存拷贝：通过读写索引分离，避免每次读写后的数据移动（如读取数据后无需 memcpy 前移剩余数据）；
+优化 I/O 效率：预留 kCheapPrepend 空间，适配 TCP 协议头（如在数据前添加长度字段），同时支持从 fd 直接读写（readFd/writeFd），减少系统调用次数；
+动态扩容策略：根据需要自动调整缓冲区大小，平衡内存占用和扩容开销
+~~~
+
