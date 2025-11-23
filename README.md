@@ -1734,3 +1734,294 @@ void EventLoopThread::threadFunc()
     loop_ = nullptr;
 }
 ~~~
+
+## EventLoopThreadPool
+
+EventLoopThreadPool 是 muduo 网络库中实现 “主从 Reactor 模型” 的核心组件，它管理着一组 EventLoopThread，为 TcpServer 提供可复用的 I/O 线程池。
+它的核心功能是：
+创建线程：根据设定的线程数，创建多个 EventLoopThread。
+管理 EventLoop：管理所有子线程创建的 EventLoop 对象。
+负载均衡：提供 getNextLoop() 方法，采用轮询（Round-Robin）策略，将新接收到的连接均匀地分配给线程池中的某个 EventLoop，从而实现多线程并发处理 I/O 事件。
+
+**EventLoopThreadPool.h**
+~~~
+#pragma once
+
+#include <functional>
+#include <string>
+#include <vector>
+#include <memory>
+
+#include "noncopyable.h"
+class EventLoop;
+class EventLoopThread;
+ 
+class EventLoopThreadPool : noncopyable
+{
+public:
+    using ThreadInitCallback = std::function<void(EventLoop *)>;
+
+    EventLoopThreadPool(EventLoop *baseLoop, const std::string &nameArg);
+    ~EventLoopThreadPool();
+
+    void setThreadNum(int numThreads) { numThreads_ = numThreads; }
+
+    void start(const ThreadInitCallback &cb = ThreadInitCallback());
+
+    // 如果工作在多线程中，baseLoop_(mainLoop)会默认以轮询的方式分配Channel给subLoop
+    EventLoop *getNextLoop();
+
+    std::vector<EventLoop *> getAllLoops(); // 获取所有的EventLoop
+
+    bool started() const { return started_; } // 是否已经启动
+    const std::string name() const { return name_; } // 获取名字
+
+private:
+    EventLoop *baseLoop_; // 用户使用muduo创建的loop 如果线程数为1 那直接使用用户创建的loop 否则创建多EventLoop
+    std::string name_;//线程池名称，通常由用户指定，线程池中EventLoopThread名称依赖于线程池名称。
+    bool started_;//是否已经启动标志
+    int numThreads_;//线程池中线程的数量
+    int next_; // 新连接到来，所选择EventLoop的索引
+    std::vector<std::unique_ptr<EventLoopThread>> threads_;//IO线程的列表
+    std::vector<EventLoop *> loops_;//线程池中EventLoop的列表，指向的是EVentLoopThread线程函数创建的EventLoop对象。
+};
+~~~
+**EventLoopSThreadPool.cc**
+1. 灵活的线程模式支持
+多线程模式：通过 setThreadNum(n) 设置线程数（n>0），创建 n 个 Sub Reactor，并发处理 I/O 事件。
+单线程模式：线程数设为 0，所有操作都在 baseLoop_ 执行，适配简单场景。
+2. 安全的资源管理
+用 std::unique_ptr 管理 EventLoopThread，自动处理线程生命周期，避免内存泄漏。
+EventLoop 基于栈分配，线程退出时自动析构，无需手动管理，减少出错风险。
+3. 高效的负载均衡
+轮询策略（getNextLoop()）简单无锁（next_ 仅在主线程修改，因为 getNextLoop() 由 TcpServer 在主线程调用），性能开销极低。
+确保每个 Sub Reactor 处理的连接数大致均衡，充分利用多核 CPU 资源。
+
+~~~
+#include <memory>
+ 
+#include "EventLoopThreadPool.h"
+#include "EventLoopThread.h"
+#include "Logger.h"
+
+/*
+保存主循环 baseLoop_（主线程的 EventLoop，即 Main Reactor）。
+保存线程池名称 name_（用于调试日志，区分不同线程池）。
+初始化状态变量：started_（是否启动）设为 false，numThreads_（线程数）初始为 0，next_（轮询索引）初始为 0。
+*/
+EventLoopThreadPool::EventLoopThreadPool(EventLoop *baseLoop, const std::string &nameArg)
+    : baseLoop_(baseLoop), name_(nameArg), started_(false), numThreads_(0), next_(0)
+{
+}
+
+EventLoopThreadPool::~EventLoopThreadPool()
+{
+    // Don't delete loop, it's stack variable
+}
+
+void EventLoopThreadPool::start(const ThreadInitCallback &cb)
+{
+    started_ = true;
+
+    for (int i = 0; i < numThreads_; ++i)
+    {
+        char buf[name_.size() + 32];
+        snprintf(buf, sizeof buf, "%s%d", name_.c_str(), i); // 生成线程名
+        EventLoopThread *t = new EventLoopThread(cb, buf); // 创建EventLoopThread
+        threads_.push_back(std::unique_ptr<EventLoopThread>(t)); // 智能指针管理，避免泄漏
+        loops_.push_back(t->startLoop()); // 底层创建线程 绑定一个新的EventLoop 并返回该loop的地址
+    }
+    // 单线程模式：线程数为 0，直接在 baseLoop_ 执行初始化回调
+    if (numThreads_ == 0 && cb) // 整个服务端只有一个线程运行baseLoop
+    {
+        cb(baseLoop_);
+    }
+}
+
+// 如果工作在多线程中，baseLoop_(mainLoop)会默认以轮询的方式分配Channel给subLoop
+EventLoop *EventLoopThreadPool::getNextLoop()
+{
+    // 如果只设置一个线程 也就是只有一个mainReactor 无subReactor 
+    // 那么轮询只有一个线程 getNextLoop()每次都返回当前的baseLoop_
+    EventLoop *loop = baseLoop_;    
+
+    // 通过轮询获取下一个处理事件的loop
+    // 如果没设置多线程数量，则不会进去，相当于直接返回baseLoop
+    if(!loops_.empty())             
+    {
+        loop = loops_[next_];
+        ++next_;
+        // 轮询
+        if(next_ >= loops_.size())  // 索引越界后重置，实现轮询
+        {
+            next_ = 0;
+        }
+    }
+
+    return loop;
+}
+
+
+
+std::vector<EventLoop *> EventLoopThreadPool::getAllLoops()
+{
+    if (loops_.empty())
+    {
+        return std::vector<EventLoop *>(1, baseLoop_); // 单线程模式：返回包含 baseLoop_ 的列表
+    }
+    else
+    {
+        return loops_;
+    }
+}
+~~~
+
+## Callback
+**.h**
+~~~
+#pragma once
+
+#include <memory>
+#include <functional>
+
+class Buffer;
+class TcpConnection;
+class Timestamp;
+
+using TcpConnectionPtr = std::shared_ptr<TcpConnection>;
+using ConnectionCallback = std::function<void(const TcpConnectionPtr &)>;
+using CloseCallback = std::function<void(const TcpConnectionPtr &)>;
+using WriteCompleteCallback = std::function<void(const TcpConnectionPtr &)>;
+using HighWaterMarkCallback = std::function<void(const TcpConnectionPtr &, size_t)>;
+
+using MessageCallback = std::function<void(const TcpConnectionPtr &,
+                                           Buffer *,
+                                           Timestamp)>;
+~~~
+
+## TcpConection
+
+
+## TcpServer
+
+
+## testserver
+简单的回显来测试muduo
+**/example/testserver.cc**
+~~~
+#include <string>
+
+#include "TcpServer.h"
+#include "Logger.h"
+
+class EchoServer
+{
+public:
+    EchoServer(EventLoop *loop, const InetAddress &addr, const std::string &name)
+        : server_(loop, addr, name)
+        , loop_(loop)
+    {
+        // 注册回调函数 
+        server_.setConnectionCallback(
+            std::bind(&EchoServer::onConnection, this, std::placeholders::_1));
+        
+        server_.setMessageCallback(
+            std::bind(&EchoServer::onMessage, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+
+        // 设置合适的subloop线程数量
+        server_.setThreadNum(3);
+    }
+    void start()
+    {
+        server_.start();
+    }
+
+private:
+    // 连接建立或断开的回调函数
+    void onConnection(const TcpConnectionPtr &conn)   
+    {
+        if (conn->connected()) 
+        {
+            conn->send("Welcome to EchoServer!\n");
+            LOG_INFO("Connection UP : %s", conn->peerAddress().toIpPort().c_str());
+        }
+        else
+        {
+            LOG_INFO("Connection DOWN : %s", conn->peerAddress().toIpPort().c_str());
+        }
+    }
+
+    // 可读写事件回调 
+    void onMessage(const TcpConnectionPtr &conn, Buffer *buf, Timestamp time)
+    {
+        std::string msg = buf->retrieveAllAsString();
+        conn->send(msg);
+        // conn->shutdown();   // 关闭写端 底层响应EPOLLHUP => 执行closeCallback_
+    }
+    TcpServer server_;
+    EventLoop *loop_;
+
+};
+
+int main() {
+    EventLoop loop;
+    InetAddress addr(8080);
+    EchoServer server(&loop, addr, "EchoServer");
+    server.start();
+    loop.loop();
+    return 0;
+}
+~~~
+
+
+**send发送信息流程**
+
+~~~
+muduo-core 项目内部流程：
+┌─────────────────────────────────────────────────────────────┐
+│ testserver.cc (应用层)                                      │
+│ └── conn->send("Welcome to EchoServer!\n")                 │
+├─────────────────────────────────────────────────────────────┤
+│ TcpConnection.cc (连接管理层)                               │
+│ ├── TcpConnection::send()                                  │
+│ ├── TcpConnection::sendInLoop()                            │
+│ └── ::write(channel_->fd(), data, len)  ← 系统调用        │
+├─────────────────────────────────────────────────────────────┤
+│ Buffer.cc (缓冲区管理层)                                    │
+│ ├── outputBuffer_.append()                                 │
+│ └── Buffer::writeFd() → ::write()                         │
+├─────────────────────────────────────────────────────────────┤
+│ Channel.cc + EventLoop.cc (事件处理层)                     │
+│ ├── Channel::handleEvent()                                 │
+│ ├── Channel::handleWrite()                                 │
+│ └── epoll 事件循环                                         │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+                    系统调用 write()
+                            ↓
+                      内核网络协议栈
+                            ↓
+                        网卡发送
+
+muduo-core 项目边界：::write(fd, data, len)
+                    ↓
+            Linux 内核网络协议栈
+                    ↓
+                TCP/IP 处理
+                    ↓
+                网卡驱动
+                    ↓
+            物理网络传输 (以太网/WiFi)
+                    ↓
+            客户端网卡接收
+                    ↓
+            客户端内核协议栈
+                    ↓
+        客户端应用程序 (telnet/浏览器/自定义程序)
+                    ↓
+        客户端程序调用 printf/cout/write(STDOUT)
+                    ↓
+            终端驱动程序
+                    ↓
+            显示器硬件 ← 最终显示
+~~~
