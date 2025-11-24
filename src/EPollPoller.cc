@@ -66,9 +66,6 @@ void EPollPoller::updateChannel(Channel *channel) {
         update(EPOLL_CTL_ADD, channel); // 调用底层update函数，执行epoll_ctl ADD操作
     } else {
         // channel已经在Poller中注册过了
-        // 断言：确保在channels_映射表中能找到这个fd，这是一个一致性检查
-        assert(channels_.find(fd) != channels_.end());
-        assert(channels_[fd] == channel);
         int fd = channel->fd();
         if (channel->isNoneEvent()) {
             update(EPOLL_CTL_DEL, channel);
