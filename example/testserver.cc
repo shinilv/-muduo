@@ -31,7 +31,6 @@ private:
     {
         if (conn->connected()) 
         {
-            conn->send("Welcome to EchoServer!\n");
             LOG_INFO("Connection UP : %s", conn->peerAddress().toIpPort().c_str());
         }
         else
