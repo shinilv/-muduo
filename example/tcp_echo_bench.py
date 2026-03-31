@@ -114,7 +114,7 @@ def main():
     parser.add_argument('--port', type=int, required=True, help='服务器端口（必填）')
     parser.add_argument('--concurrency', type=int, default=100, help='并发客户端数，默认100')
     parser.add_argument('--msgs-per-client', type=int, default=1000, help='每个客户端发送的消息数，默认1000')
-    parser.add_argument('--msg', default='hello, muduo!\n', help='发送的消息内容，默认"hello, muduo!\n"')
+    parser.add_argument('--msg', default='hello, muduo!\n', help='发送的消息内容，默认"hi!\n"')
     parser.add_argument('--timeout', type=int, default=5, help='连接/读写超时时间（秒），默认5')
     
     args = parser.parse_args()
